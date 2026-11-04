@@ -7,16 +7,6 @@ from huggingface_hub import InferenceClient
 from transformers import pipeline
 
 
-try:
-    import spaces
-    GPU = spaces.GPU
-except ImportError:
-    def GPU(*args, **kwargs):
-        def decorator(fn):
-            return fn
-        return decorator
-
-
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -37,11 +27,13 @@ SUBJECTS = [
     "General",
 ]
 
+# Load the local model when the application starts.
+# The Hugging Face cache can be persisted with a Docker volume.
 pipe = pipeline("text-generation", model=LOCAL_MODEL)
 
 
 def clean_token(raw):
-    """Strip whitespace and stray quote characters that sneak in from the shell."""
+    """Strip whitespace and stray quote characters from a token."""
     if not raw:
         return None
     return raw.strip().strip('"').strip("'").strip()
@@ -121,8 +113,8 @@ def strip_thinking(text):
 # MODEL CALLS
 # ============================================================
 
-@GPU(duration=60)
 def local_generate(messages, max_tokens, temperature, top_p):
+    """Generate a response using the local model on CPU or available CUDA."""
     if torch.cuda.is_available():
         pipe.model.to("cuda")
         pipe.device = torch.device("cuda")
@@ -134,8 +126,8 @@ def local_generate(messages, max_tokens, temperature, top_p):
         temperature=temperature,
         top_p=top_p,
     )
-    text = outputs[0]["generated_text"][-1]["content"]
-    return strip_thinking(text)
+    generated_text = outputs[0]["generated_text"][-1]["content"]
+    return strip_thinking(generated_text)
 
 
 def remote_stream(messages, max_tokens, temperature, top_p, token):
@@ -198,10 +190,15 @@ def chat_and_update(
     if use_local:
         try:
             reply = local_generate(
-                messages, response_length, temperature, top_p)
-            yield set_reply(reply or "⚠️ The local model returned an empty response.")
+                messages, response_length, temperature, top_p
+            )
+            yield set_reply(
+                reply or "⚠️ The local model returned an empty response."
+            )
         except Exception as e:
-            yield set_reply(f"❌ Local model failed:\n\n`{type(e).__name__}: {e}`")
+            yield set_reply(
+                f"❌ Local model failed:\n\n`{type(e).__name__}: {e}`"
+            )
         return
 
     # ---------------- Remote model ----------------
@@ -210,15 +207,15 @@ def chat_and_update(
     if not token:
         yield set_reply(
             "⚠️ No token found. Log in with the button above, "
-            'or set $env:HF_TOKEN="hf_..." before running locally.'
+            'or set the HF_TOKEN environment variable before running locally.'
         )
         return
 
     if not token.startswith("hf_"):
         yield set_reply(
-            "⚠️ The token doesn't start with `hf_`, so the Hugging Face router "
-            "will reject it. Check for stray quotes or whitespace in your "
-            "`$env:HF_TOKEN` value and set it again."
+            "⚠️ The token doesn't start with `hf_`, so the Hugging Face "
+            "router may reject it. Check for stray quotes or whitespace "
+            "in your HF_TOKEN value."
         )
         return
 
@@ -237,7 +234,9 @@ def chat_and_update(
                 "Please try asking the question again."
             )
     except Exception as e:
-        yield set_reply(f"❌ Remote model failed:\n\n`{type(e).__name__}: {e}`")
+        yield set_reply(
+            f"❌ Remote model failed:\n\n`{type(e).__name__}: {e}`"
+        )
 
 
 def clear_chat():
@@ -247,16 +246,18 @@ def clear_chat():
 def model_info(model_choice):
     if model_choice == LOCAL_CHOICE:
         return (
-            "**Deployment:** Runs locally on the Space (ZeroGPU / CPU)\n\n"
+            "**Deployment:** Runs locally in this application container\n\n"
             f"**Model:** `{LOCAL_MODEL}`\n\n"
-            "**Pros:** private, no API cost, no rate limits\n\n"
-            "**Cons:** smaller model, slower on CPU"
+            "**Pros:** no external API call or API usage cost; can run offline "
+            "after the model is cached\n\n"
+            "**Cons:** smaller model; response speed depends on available CPU/GPU"
         )
     return (
         "**Deployment:** Remote API via Hugging Face Inference Providers\n\n"
         f"**Model:** `{REMOTE_MODEL}`\n\n"
-        "**Pros:** much larger model, fast streaming\n\n"
-        "**Cons:** needs a token, subject to rate limits and usage costs"
+        "**Pros:** much larger model, fast streaming when provider capacity is available\n\n"
+        "**Cons:** requires a Hugging Face token and may be subject to "
+        "rate limits and usage costs"
     )
 
 
@@ -273,7 +274,7 @@ with gr.Blocks(title="StudyMate AI") as demo:
                 # 🎓 StudyMate AI
                 ### Your AI-Powered Study Assistant
                 Ask questions, understand difficult concepts, and learn with
-                either a remotely hosted LLM or a model running right here on the Space.
+                either a remotely hosted LLM or a model running in this application.
                 """
             )
         with gr.Column(scale=1, min_width=160):
@@ -305,9 +306,10 @@ with gr.Blocks(title="StudyMate AI") as demo:
                 label="📚 Subject",
             )
 
+            # Local mode is selected by default for the first VM deployment.
             model_choice = gr.Radio(
                 choices=[REMOTE_CHOICE, LOCAL_CHOICE],
-                value=REMOTE_CHOICE,
+                value=LOCAL_CHOICE,
                 label="🤖 Model",
             )
 
@@ -327,14 +329,14 @@ with gr.Blocks(title="StudyMate AI") as demo:
                 )
 
             gr.Markdown("## ℹ️ Model Information")
-            info = gr.Markdown(model_info(REMOTE_CHOICE))
+            info = gr.Markdown(model_info(LOCAL_CHOICE))
 
             gr.Markdown(
                 """
                 ---
                 💡 **Tip:** Select a subject so StudyMate can tailor its
                 explanations to your topic. The local model is smaller, so
-                keep questions short when using it.
+                keep questions relatively short when using it.
                 """
             )
 
@@ -344,15 +346,26 @@ with gr.Blocks(title="StudyMate AI") as demo:
         response_length, temperature, top_p,
     ]
 
-    send_button.click(chat_and_update, inputs=chat_inputs,
-                      outputs=[chatbot, message])
-    message.submit(chat_and_update, inputs=chat_inputs,
-                   outputs=[chatbot, message])
-    clear_button.click(clear_chat, inputs=None, outputs=[chatbot, message])
+    send_button.click(
+        chat_and_update,
+        inputs=chat_inputs,
+        outputs=[chatbot, message],
+    )
+    message.submit(
+        chat_and_update,
+        inputs=chat_inputs,
+        outputs=[chatbot, message],
+    )
+    clear_button.click(
+        clear_chat,
+        inputs=None,
+        outputs=[chatbot, message],
+    )
     model_choice.change(model_info, inputs=model_choice, outputs=info)
 
 
 PORT = int(os.getenv("PORT", "6550"))
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port= PORT)
+    # Bind to all interfaces so Docker port publishing can reach Gradio.
+    demo.launch(server_name="0.0.0.0", server_port=PORT)
