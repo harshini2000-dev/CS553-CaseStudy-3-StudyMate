@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+.idea/
+.env
+*.ipynb
+*.mat
+*.csv
+*.parquet
+models/
