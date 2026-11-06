@@ -3,4 +3,3 @@ huggingface_hub
 transformers>=4.51.0
 torch
 prometheus_client
-#spaces
